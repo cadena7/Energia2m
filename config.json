@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "offsets": {
+    "Norte": 1.5696,
+    "Sur": 1.5685,
+    "Este": 1.565,
+    "Oeste": 1.5668
+  },
+  "deadbands": {
+    "Norte": 0.35,
+    "Sur": 0.35,
+    "Este": 0.3,
+    "Oeste": 0.3
+  }
+}

@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Medidor de Energía Consola 2m</title>
+    <script src="/static/Chart.min.js" defer></script>
+    <script src="/static/polling.js?v=2" defer></script>
+    <script src="/static/dashboard.js?v=3" defer></script>
+    <link rel="stylesheet" href="/static/calibration.css">
+    <script src="/static/calibration.js?v=4" defer></script>
+</head>
+<body>
+    <h1>Medidor de Energía Consola 2m</h1>
+
+    <!-- ===== VALORES NUMÉRICOS ===== -->
+    <div style="display:flex; gap:40px; font-size:22px; margin-bottom:15px;">
+        <div style="color:red;">
+            <strong>Norte:</strong> <span id="valN">—</span> A
+        </div>
+        <div style="color:blue;">
+            <strong>Sur:</strong> <span id="valS">—</span> A
+        </div>
+        <div style="color:green;">
+            <strong>Este:</strong> <span id="valE">—</span> A
+        </div>
+        <div style="color:purple;">
+            <strong>Oeste:</strong> <span id="valO">—</span> A
+        </div>
+    </div>
+
+    <p id="connection-status" role="status" style="color:#666; font-size:13px;">Conectando con el ESP32…</p>
+
+    <canvas id="chart" width="400" height="200"></canvas>
+
+    <footer style="margin-top:25px; text-align:center; color:#666; font-size:13px;">
+        © 2026 — Desarrollado por <strong>Edgar Omar Cadena Zepeda</strong><br>
+        Instituto de Astronomía — UNAM, Ensenada
+    </footer>
+
+    <details id="calibration-panel">
+        <summary>Configuración · Calibración de canales</summary>
+        <p>Offsets en voltios. Para calibrar el cero, verifica que no circule corriente
+           y usa como referencia el voltaje medido de cada canal.</p>
+        <p class="calibration-note">El voltaje mostrado proviene del ADC filtrado,
+           antes de aplicar el offset y la zona muerta. Las flechas ajustan el offset
+           en pasos de 0.0001 V y la zona muerta en pasos de 0.01 A.</p>
+        <p class="calibration-note">Zona muerta (deadband) en amperes: 0.35 pone en cero
+           las corrientes entre −0.35 y +0.35 A. Usa 0 para desactivarla.</p>
+        <form id="calibration-form">
+            <fieldset id="calibration-fields" disabled>
+                <div class="calibration-table">
+                    <table>
+                        <thead><tr><th>Canal</th><th>Voltaje medido (V)</th><th>Offset (V)</th><th>Zona muerta (±A)</th></tr></thead>
+                        <tbody id="calibration-rows"></tbody>
+                    </table>
+                </div>
+                <button type="submit">Guardar y aplicar</button>
+            </fieldset>
+        </form>
+        <p id="calibration-status" role="status" aria-live="polite"></p>
+        <p id="calibration-live" class="calibration-note"></p>
+    </details>
+
+
+</body>
+</html>

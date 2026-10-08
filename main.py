@@ -1,7 +1,7 @@
 # main.py
 # Medidor de Energia de la Consola del 2m
 # © 2026 — Desarrollado por Edgar Omar Cadena Zepeda (IA-UNAM Ensenada)
-# 7 de mayo de 2026
+# 14 de septiembre de 2026
 
 import machine
 import asyncio
@@ -9,7 +9,8 @@ import time
 import gc
 from mqtt_as import MQTTClient, config
 import ujson
-from lib.microdot.microdot import Microdot, send_file
+from lib.microdot.microdot import Microdot, Request, send_file
+from calibration import CalibrationStore
 
 
 # =========================
@@ -49,17 +50,17 @@ ADC_RESOLUTION = 4095
 
 IPN_HSTS016L = 20
 SENSITIVITY_HSTS016L = 0.625 / IPN_HSTS016L
-DEADBAND_A = 0.3
 
 
 class HSTS016L:
-    def __init__(self, adc_pin, offset=1.56, deadband=DEADBAND_A):
+    def __init__(self, adc_pin, offset, deadband):
         self.adc = machine.ADC(machine.Pin(adc_pin), atten=3)
         self.offset = offset
         self.pin = adc_pin
         self.deadband = deadband
+        self.voltage = None
 
-    async def read_current(self, n=41, trim=10):
+    async def read_voltage(self, n=41, trim=10):
 
         # ---------------------------------------------------------
         # 📌 FILTRO ANTI-PICOS
@@ -86,16 +87,26 @@ class HSTS016L:
         avg = sum(samples) / len(samples)
 
         v = avg * (VCC / ADC_RESOLUTION)
+        self.voltage = v  # Voltaje filtrado, antes de offset y deadband.
 
         # ---------------------------------------------------------
         # 📌 DESCOMENTAR ESTE PRINT PARA CALIBRAR OFFSET DEL SENSOR
         #
         # print("Sensor ADC Pin({}): V_ADC a 0A = {:.7f}".format(self.pin, v))
         #
-        # Usa esos valores (con corriente cero) para definir nuevos offsets:
-        # sensor_norte = HSTS016L(32, offset=VALOR_MEDIDO)
+        # Con corriente cero, registra varias lecturas para calcular
+        # el offset con estadística. El voltaje ya tiene el filtro
+        # anti-picos; todavía no se aplica el offset ni el deadband.
+        # Guarda los offsets calculados en el panel web de calibración
+        # (Guardar y aplicar), para que persistan en config.json.
         # ---------------------------------------------------------
 
+        return v
+
+    async def read_current(self, n=41, trim=10):
+        if self.offset is None or self.deadband is None:
+            raise ValueError('Sensor sin calibración válida.')
+        v = await self.read_voltage(n, trim)
         I = (v - self.offset) / SENSITIVITY_HSTS016L
 
         # ---------------------------------------------------------
@@ -111,10 +122,17 @@ class HSTS016L:
         return I
 
 
-sensor_norte = HSTS016L(32, offset=1.5696, deadband=0.35)
-sensor_sur = HSTS016L(35, offset=1.5685, deadband=0.35)
-sensor_este = HSTS016L(36, offset=1.5650, deadband=0.30)
-sensor_oeste = HSTS016L(39, offset=1.5668, deadband=0.30)
+calibration = CalibrationStore(allow_unconfigured=True)
+if calibration.warning:
+    print('[Calibración]', calibration.warning)
+sensor_norte = HSTS016L(32, offset=calibration.offsets.get('Norte'), deadband=calibration.deadbands.get('Norte'))
+sensor_sur = HSTS016L(35, offset=calibration.offsets.get('Sur'), deadband=calibration.deadbands.get('Sur'))
+sensor_este = HSTS016L(36, offset=calibration.offsets.get('Este'), deadband=calibration.deadbands.get('Este'))
+sensor_oeste = HSTS016L(39, offset=calibration.offsets.get('Oeste'), deadband=calibration.deadbands.get('Oeste'))
+sensors = {'Norte': sensor_norte, 'Sur': sensor_sur,
+           'Este': sensor_este, 'Oeste': sensor_oeste}
+measurement_lock = asyncio.Lock()
+measurements_ready = False
 
 
 sensor_values = {
@@ -147,6 +165,9 @@ def mqtt_callback(topic, msg, retained):
         data = ujson.loads(msg.decode())
     except Exception as e:
         print("[MQTT] Comando JSON inválido:", e)
+        return
+
+    if not calibration.ready:
         return
 
     cmd = data.get("comando") or data.get("command")
@@ -195,7 +216,7 @@ async def on_connect(client):
 
 
 config['connect_coro'] = on_connect
-client = MQTTClient(config)
+client = None
 
 
 async def safe_publish(topic, payload, *, retain=False, qos=1, timeout_s=3):
@@ -207,6 +228,11 @@ async def safe_publish(topic, payload, *, retain=False, qos=1, timeout_s=3):
 # MICRODOT
 # =========================
 app = Microdot()
+# Calibration fits comfortably in 1 KB; keep incoming requests bounded.
+Request.max_content_length = 1024
+Request.max_body_length = 1024
+Request.max_readline = 2048
+Request.max_header_length = 8192
 
 
 def is_safe_static_filename(filename):
@@ -229,7 +255,8 @@ async def static(request, filename):
     try:
         resp = send_file('static/' + filename)
         resp.headers['Connection'] = 'close'
-        resp.headers['Cache-Control'] = 'public, max-age=86400'
+        resp.headers['Cache-Control'] = ('public, max-age=86400'
+                                         if filename == 'Chart.min.js' else 'no-cache')
         return resp
     except OSError:
         return 'Not found', 404
@@ -237,144 +264,18 @@ async def static(request, filename):
 
 @app.route('/')
 async def index(request):
-    html = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Medidor de Energía Consola 2m</title>
-    <script src="/static/Chart.min.js"></script>
-</head>
-<body>
-    <h1>Medidor de Energía Consola 2m</h1>
-
-    <!-- ===== VALORES NUMÉRICOS ===== -->
-    <div style="display:flex; gap:40px; font-size:22px; margin-bottom:15px;">
-        <div style="color:red;">
-            <strong>Norte:</strong> <span id="valN">0.00</span> A
-        </div>
-        <div style="color:blue;">
-            <strong>Sur:</strong> <span id="valS">0.00</span> A
-        </div>
-        <div style="color:green;">
-            <strong>Este:</strong> <span id="valE">0.00</span> A
-        </div>
-        <div style="color:purple;">
-            <strong>Oeste:</strong> <span id="valO">0.00</span> A
-        </div>
-    </div>
-
-    <canvas id="chart" width="400" height="200"></canvas>
-
-    <footer style="margin-top:25px; text-align:center; color:#666; font-size:13px;">
-        © 2026 — Desarrollado por <strong>Edgar Omar Cadena Zepeda</strong><br>
-        Instituto de Astronomía — UNAM, Ensenada
-    </footer>
-
-    <script>
-        let ctx = document.getElementById('chart').getContext('2d');
-        let chart = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: [],
-                datasets: [
-                    { label: 'Norte (A)', data: [], borderColor: 'red', borderWidth:1, yAxisID: 'y' },
-                    { label: 'Sur (A)',   data: [], borderColor: 'blue', borderWidth:1, yAxisID: 'y' },
-                    { label: 'Este (A)',  data: [], borderColor: 'green', borderWidth:1, yAxisID: 'y' },
-                    { label: 'Oeste (A)', data: [], borderColor: 'purple', borderWidth:1, yAxisID: 'y2' }
-                ]
-            },
-            options: {
-                        animation: false, // <-- Desactiva todas las animaciones
-                        responsive: true,
-                        scales: {
-                            x: {
-                                title: { display:true, text:'Tiempo (s)' }
-                            },
-                            y: {
-                                position: 'left',
-                                title:{ display:true, text:'Corriente (A)' },
-                                beginAtZero: false,
-                                ticks: { suggestedMin: -10, suggestedMax: 10 }
-                            },
-                            y2: {
-                                display: true,
-                                position: 'right',
-                                beginAtZero: false,
-                                ticks: { suggestedMin: -10, suggestedMax: 10 },
-                                grid: {
-                                    drawOnChartArea: false
-                                }
-                            }
-                        }
-                    }
-        });
-
-        async function update() {
-                try {
-                    let r = await fetch('/api/history', { cache: 'no-store' });
-                    if (!r.ok) return;
-                    let d = await r.json();
-
-                    let dt = Number(d.SAMPLE_INTERVAL_MS || 500) / 1000.0;
-                    let last = d.Norte.length - 1;
-                    chart.data.labels = d.Norte.map((_, index) => ((index - last) * dt).toFixed(1) + "s");
-                    chart.data.datasets[0].data = d.Norte;
-                    chart.data.datasets[1].data = d.Sur;
-                    chart.data.datasets[2].data = d.Este;
-                    chart.data.datasets[3].data = d.Oeste;
-
-                    // ===== ACTUALIZAR VALORES NUMÉRICOS =====
-                    if (d.Norte.length > 0) {
-                        document.getElementById("valN").innerText = d.Norte[last].toFixed(2);
-                        document.getElementById("valS").innerText = d.Sur[last].toFixed(2);
-                        document.getElementById("valE").innerText = d.Este[last].toFixed(2);
-                        document.getElementById("valO").innerText = d.Oeste[last].toFixed(2);
-                    }
-
-                    // ===== SINCRONIZAR EJES IZQUIERDO Y DERECHO =====
-                    let allValues = [
-                        ...d.Norte,
-                        ...d.Sur,
-                        ...d.Este,
-                        ...d.Oeste
-                    ];
-
-                    if (allValues.length > 0) {
-                        let min = Math.min(...allValues);
-                        let max = Math.max(...allValues);
-
-                        // Margen visual
-                        let padding = (max - min) * 0.1 || 1;
-
-                        chart.options.scales.y.min = min - padding;
-                        chart.options.scales.y.max = max + padding;
-
-                        chart.options.scales.y2.min = min - padding;
-                        chart.options.scales.y2.max = max + padding;
-                    }
-
-                    chart.update('none');
-
-                } catch(e){}
-            }
-
-        setInterval(update, 1000);
-    </script>
-</body>
-</html>
-"""
-    return html, 200, {
-        'Content-Type': 'text/html',
-        'Connection': 'close',
-        'Cache-Control': 'no-store'
-    }
+    # Stream the HTML in small chunks instead of encoding a full copy per client.
+    response = send_file('static/index.html', content_type='text/html; charset=utf-8')
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @app.route('/api/history')
 async def api_history(request):
     payload = {
         "SAMPLE_INTERVAL_MS": sample_interval_ms,
+        "calibration_ready": calibration.ready,
+        "warning": calibration.warning,
         "Norte": history["Norte"],
         "Sur": history["Sur"],
         "Este": history["Este"],
@@ -385,6 +286,61 @@ async def api_history(request):
         'Connection': 'close',
         'Cache-Control': 'no-store'
     }
+
+
+def calibration_response(payload, status=200):
+    return ujson.dumps(payload), status, {
+        'Content-Type': 'application/json',
+        'Connection': 'close',
+        'Cache-Control': 'no-store'
+    }
+
+
+@app.route('/api/calibration', methods=['GET', 'POST'])
+async def api_calibration(request):
+    global measurements_ready
+    if request.method == 'GET':
+        async with measurement_lock:
+            return calibration_response({
+                'offsets': calibration.offsets,
+                'deadbands': calibration.deadbands,
+                'voltages': {name: sensor.voltage for name, sensor in sensors.items()},
+                'warning': calibration.warning,
+                'ready': calibration.ready,
+            })
+    try:
+        data = request.json
+        if not isinstance(data, dict):
+            raise ValueError('Se requiere un objeto JSON con offsets.')
+        async with measurement_lock:
+            previous = calibration.offsets
+            previous_deadbands = calibration.deadbands
+            # Los clientes anteriores pueden seguir enviando solo offsets.
+            written = calibration.save(data.get('offsets'),
+                                       data.get('deadbands', calibration.deadbands))
+            changed = (previous != calibration.offsets
+                       or previous_deadbands != calibration.deadbands)
+            if changed:
+                for name, sensor in sensors.items():
+                    sensor.offset = calibration.offsets[name]
+                    sensor.deadband = calibration.deadbands[name]
+                    history[name].clear()
+                # MQTT espera el primer ciclo completo con los nuevos offsets.
+                measurements_ready = False
+            return calibration_response({
+                'offsets': calibration.offsets,
+                'deadbands': calibration.deadbands,
+                'ready': calibration.ready,
+                'message': ('Calibración guardada y aplicada. No es necesario reiniciar.'
+                            if written else 'La calibración ya estaba guardada y aplicada.'),
+            })
+    except (ValueError, TypeError) as error:
+        return calibration_response({'error': str(error)}, 400)
+    except OSError as error:
+        print('[Calibración] Error al guardar:', error)
+        return calibration_response({
+            'error': 'No se pudo completar el guardado. La calibración activa no cambió; vuelve a intentarlo.'
+        }, 500)
 
 
 def build_status_payload():
@@ -410,16 +366,23 @@ def append_history():
 
 
 async def sampling_task():
+    global measurements_ready
     while True:
         try:
             maintain_memory()
             wdt.feed()
 
-            sensor_values["Norte"] = await sensor_norte.read_current()
-            sensor_values["Sur"] = await sensor_sur.read_current()
-            sensor_values["Este"] = await sensor_este.read_current()
-            sensor_values["Oeste"] = await sensor_oeste.read_current()
-            append_history()
+            async with measurement_lock:
+                measurements_ready = False
+                if calibration.ready:
+                    for name, sensor in sensors.items():
+                        sensor_values[name] = await sensor.read_current()
+                    append_history()
+                    measurements_ready = True
+                else:
+                    # Solo voltajes ADC para configurar el cero; no son corrientes.
+                    for sensor in sensors.values():
+                        await sensor.read_voltage()
 
             await asyncio.sleep_ms(sample_interval_ms)
 
@@ -429,13 +392,18 @@ async def sampling_task():
 
 
 async def mqtt_task():
-    global last_status_sent
+    global last_status_sent, client
 
     while True:
         try:
             maintain_memory()
             wdt.feed()
 
+            if not calibration.ready:
+                await asyncio.sleep_ms(500)
+                continue
+            if client is None:
+                client = MQTTClient(config)
             print("Intentando conectar al broker...")
             await client.connect()
             print("MQTT conectado.")
@@ -456,26 +424,25 @@ async def mqtt_task():
                     last_status_sent = now_state
 
                 if publishing_enabled:
-                    payload = ujson.dumps({
-                        "Norte": round(sensor_values["Norte"], 2),
-                        "Sur":   round(sensor_values["Sur"], 2),
-                        "Este":  round(sensor_values["Este"], 2),
-                        "Oeste": round(sensor_values["Oeste"], 2)
-                    })
-
-                    await safe_publish(
-                        MEAS_TOPIC,
-                        payload,
-                        retain=False,
-                        qos=1
-                    )
+                    async with measurement_lock:
+                        payload = (ujson.dumps({
+                            name: round(sensor_values[name], 2) for name in sensors
+                        }) if measurements_ready else None)
+                    if payload is not None:
+                        await safe_publish(
+                            MEAS_TOPIC,
+                            payload,
+                            retain=False,
+                            qos=1
+                        )
 
                 await asyncio.sleep_ms(sample_interval_ms)
 
         except Exception as e:
             print("MQTT error:", e)
             try:
-                await client.disconnect()
+                if client is not None:
+                    await client.disconnect()
             except Exception as disconnect_error:
                 print("MQTT disconnect error:", disconnect_error)
             await asyncio.sleep(5)
@@ -487,8 +454,17 @@ async def web_task():
             await app.start_server(port=80)
         except Exception as e:
             print("Web error:", e)
-            maintain_memory()
-            await asyncio.sleep(3)
+        finally:
+            # Release the old listener before rebinding after an error.
+            if app.server is not None:
+                try:
+                    app.server.close()
+                    await asyncio.wait_for(app.server.wait_closed(), 2)
+                except Exception as close_error:
+                    print('Web close error:', close_error)
+                app.server = None
+        maintain_memory()
+        await asyncio.sleep(3)
 
 
 def el_main():

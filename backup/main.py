@@ -1,7 +1,7 @@
 # main.py
 # Medidor de Energia de la Consola del 2m
 # © 2026 — Desarrollado por Edgar Omar Cadena Zepeda (IA-UNAM Ensenada)
-# 6 de mayo de 2026
+# 7 de mayo de 2026
 
 import machine
 import asyncio
@@ -227,7 +227,10 @@ async def static(request, filename):
     if not is_safe_static_filename(filename):
         return 'Forbidden', 403
     try:
-        return send_file('static/' + filename)
+        resp = send_file('static/' + filename)
+        resp.headers['Connection'] = 'close'
+        resp.headers['Cache-Control'] = 'public, max-age=86400'
+        return resp
     except OSError:
         return 'Not found', 404
 
@@ -309,7 +312,7 @@ async def index(request):
 
         async function update() {
                 try {
-                    let r = await fetch('/api/history');
+                    let r = await fetch('/api/history', { cache: 'no-store' });
                     if (!r.ok) return;
                     let d = await r.json();
 
@@ -361,7 +364,11 @@ async def index(request):
 </body>
 </html>
 """
-    return html, 200, {'Content-Type': 'text/html'}
+    return html, 200, {
+        'Content-Type': 'text/html',
+        'Connection': 'close',
+        'Cache-Control': 'no-store'
+    }
 
 
 @app.route('/api/history')
@@ -373,7 +380,11 @@ async def api_history(request):
         "Este": history["Este"],
         "Oeste": history["Oeste"]
     }
-    return ujson.dumps(payload), 200, {'Content-Type': 'application/json'}
+    return ujson.dumps(payload), 200, {
+        'Content-Type': 'application/json',
+        'Connection': 'close',
+        'Cache-Control': 'no-store'
+    }
 
 
 def build_status_payload():
