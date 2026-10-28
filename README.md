@@ -87,6 +87,11 @@ Cuando falta comunicacion, las lecturas numericas muestran `—` y aparece un av
 de reconexion; la grafica conserva su ultimo historial hasta recuperar datos.
 
 El historial se limita a `MAX_HISTORY = 40` muestras para cuidar la RAM del ESP32.
+La página muestra por separado el estado de la consulta de datos y el de la
+gráfica. Los errores indican red, timeout, HTTP, JSON o historial inválido;
+los fallos al iniciar o dibujar la gráfica conservan las lecturas numéricas y
+se detallan también en la consola del navegador. `static/Chart.min.js` es la
+distribución UMD 4.5.0, que expone `Chart` al cargarla como script normal.
 La grafica calcula sus etiquetas de tiempo en el navegador como una ventana relativa de los ultimos 40 puntos; el punto mas reciente se muestra como `0.0s`.
 
 ## Protecciones
@@ -205,6 +210,7 @@ Pruebas adicionales en PC:
 
 ```sh
 node --test tests/test_polling.cjs
+node --test tests/test_dashboard.cjs
 python3 tests/stress_http.py
 ```
 
