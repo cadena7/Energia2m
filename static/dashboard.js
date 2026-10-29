@@ -2,7 +2,12 @@
     const channels = ['Norte', 'Sur', 'Este', 'Oeste'];
     const values = ['valN', 'valS', 'valE', 'valO'].map(id => document.getElementById(id));
     const status = document.getElementById('connection-status');
-    const chart = typeof Chart === 'function' ? new Chart(document.getElementById('chart'), {
+    const chartStatus = document.getElementById('chart-status');
+    const detail = error => error && error.message ? error.message : String(error);
+    let chart = null;
+    try {
+        if (typeof Chart !== 'function') throw new Error('Chart.js no está disponible. Comprueba /static/Chart.min.js y recarga sin caché.');
+        chart = new Chart(document.getElementById('chart'), {
         type: 'line',
         data: {
             labels: [],
@@ -27,17 +32,32 @@
                 }
             }
         }
-    }) : null;
+    });
+    } catch (error) {
+        chartStatus.textContent = 'Error al iniciar la gráfica: ' + detail(error);
+        console.error('Inicialización de la gráfica', error);
+    }
 
     createDevicePoller({
         async run(signal) {
-            const response = await fetch('/api/history', { cache: 'no-store', signal });
+            let response;
+            try {
+                response = await fetch('/api/history', { cache: 'no-store', signal });
+            } catch (error) {
+                throw new Error((error.name === 'AbortError' ? 'Tiempo de espera agotado' : 'Fallo de red') + ': ' + detail(error));
+            }
             if (!response.ok) throw new Error('HTTP ' + response.status);
-            const data = await response.json();
+            let data;
+            try { data = await response.json(); }
+            catch (error) { throw new Error('Respuesta JSON inválida: ' + detail(error)); }
+            if (!data || typeof data !== 'object') throw new Error('Historial inválido: se esperaba un objeto JSON');
             const series = channels.map(name => data[name]);
             if (!series.every(points => Array.isArray(points) && points.length <= 40
                 && points.every(Number.isFinite) && points.length === series[0].length)) {
-                throw new Error('Historial inválido');
+                throw new Error('Historial inválido: canales incompletos, valores no numéricos o longitudes incorrectas');
+            }
+            if (!Number.isFinite(data.SAMPLE_INTERVAL_MS) || data.SAMPLE_INTERVAL_MS <= 0) {
+                throw new Error('Historial inválido: SAMPLE_INTERVAL_MS debe ser un número positivo');
             }
             if (signal.aborted) return;
             const last = series[0].length - 1;
@@ -45,6 +65,7 @@
                 element.textContent = last >= 0 ? series[index][last].toFixed(2) : '—';
             });
             if (chart) {
+                try {
                 const dt = Number(data.SAMPLE_INTERVAL_MS || 500) / 1000;
                 chart.data.labels = series[0].map((_, index) => ((index - last) * dt).toFixed(1) + 's');
                 series.forEach((points, index) => { chart.data.datasets[index].data = points; });
@@ -59,18 +80,23 @@
                     }
                 }
                 chart.update('none');
+                chartStatus.textContent = 'Gráfica actualizada.';
+                } catch (error) {
+                    chartStatus.textContent = 'Error al dibujar la gráfica: ' + detail(error);
+                    console.error('Actualización de la gráfica', error);
+                }
             }
             if (data.calibration_ready === false) {
                 status.textContent = data.warning;
                 document.getElementById('calibration-panel').open = true;
                 return;
             }
-            status.textContent = chart ? 'Conectado al ESP32.'
-                : 'Lecturas conectadas. Recarga la página para volver a cargar la gráfica.';
+            status.textContent = 'Datos recibidos del ESP32.';
         },
-        onError() {
+        onError(error) {
             values.forEach(element => { element.textContent = '—'; });
-            status.textContent = 'Sin datos nuevos del ESP32. Reconectando automáticamente…';
+            status.textContent = 'Error al consultar /api/history: ' + detail(error) + '. Reintentando automáticamente…';
+            console.error('Consulta de datos', error);
         }
     });
 })();

@@ -315,8 +315,6 @@ class Request:
     #:
     #:    Request.max_readline = 16 * 1024  # 16KB lines allowed
     max_readline = 2 * 1024
-    # Local hardening: also bound the sum of headers, not only each line.
-    max_header_length = 8 * 1024
 
     class G:
         pass
@@ -411,15 +409,9 @@ class Request:
         # headers
         headers = NoCaseDict()
         content_length = 0
-        header_length = 0
         while True:
-            raw_line = await Request._safe_readline(client_reader)
-            header_length += len(raw_line)
-            if header_length > Request.max_header_length:
-                raise ValueError('headers too long')
-            if not raw_line:
-                raise ValueError('incomplete headers')
-            line = raw_line.strip().decode()
+            line = (await Request._safe_readline(
+                client_reader)).strip().decode()
             if line == '':
                 break
             header, value = line.split(':', 1)
@@ -427,8 +419,6 @@ class Request:
             headers[header] = value
             if header.lower() == 'content-length':
                 content_length = int(value)
-                if content_length < 0:
-                    raise ValueError('negative content length')
 
         # body
         body = b''
@@ -541,19 +531,10 @@ class Request:
 
     @staticmethod
     async def _safe_readline(stream):
-        # Stream.readline() in MicroPython has no size argument and can allocate
-        # an arbitrarily long line before returning. Bound allocation up front.
-        line = bytearray()
-        while len(line) <= Request.max_readline:
-            char = await stream.read(1)
-            if not char:
-                return bytes(line)
-            line.extend(char)
-            if len(line) > Request.max_readline:
-                break
-            if char == b'\n':
-                return bytes(line)
-        raise ValueError('line too long')
+        line = (await stream.readline())
+        if len(line) > Request.max_readline:
+            raise ValueError('line too long')
+        return line
 
 
 class Response:
@@ -632,7 +613,7 @@ class Response:
         """
         if ';' in value:
             raise ValueError('invalid cookie value')
-        http_cookie = '{cookie}={value}'.format(cookie=cookie, value=value)
+        http_cookie = f'{cookie}={value}'
         if path:
             http_cookie += '; Path=' + path
         if domain:
@@ -682,9 +663,9 @@ class Response:
                 self.headers['Content-Type'] += '; charset=UTF-8'
 
     async def write(self, stream):
-        body_iterator = self.body_iter()
+        self.complete()
+
         try:
-            self.complete()
             # status code
             reason = self.reason if self.reason is not None else \
                 ('OK' if self.status_code == 200 else 'N/A')
@@ -701,10 +682,20 @@ class Response:
 
             # body
             if not self.is_head:
-                async for body in body_iterator:
+                iter = self.body_iter()
+                async for body in iter:
                     if isinstance(body, str):  # pragma: no cover
                         body = body.encode()
-                    await stream.awrite(body)
+                    try:
+                        await stream.awrite(body)
+                    except OSError as exc:  # pragma: no cover
+                        if exc.errno in MUTED_SOCKET_ERRORS or \
+                                exc.args[0] == 'Connection lost':
+                            if hasattr(iter, 'aclose'):
+                                await iter.aclose()
+                        raise
+                if hasattr(iter, 'aclose'):  # pragma: no branch
+                    await iter.aclose()
 
         except OSError as exc:  # pragma: no cover
             if exc.errno in MUTED_SOCKET_ERRORS or \
@@ -712,11 +703,6 @@ class Response:
                 pass
             else:
                 raise
-        finally:
-            # Includes HEAD, disconnects during headers and cancellation of a
-            # stalled download. A send_file() body must always be closed.
-            if hasattr(body_iterator, 'aclose'):
-                await body_iterator.aclose()
 
     def body_iter(self):
         if hasattr(self.body, '__anext__'):
@@ -730,9 +716,6 @@ class Response:
             ITER_SYNC_GEN = 1
             ITER_FILE_OBJ = 2
             ITER_NO_BODY = -1
-
-            def __init__(self):
-                self.closed = False
 
             def __aiter__(self):
                 if response.body:
@@ -768,9 +751,6 @@ class Response:
                 return buf
 
             async def aclose(self):
-                if self.closed:
-                    return
-                self.closed = True
                 if hasattr(response.body, 'close'):
                     result = response.body.close()
                     if iscoroutine(result):  # pragma: no cover
@@ -839,7 +819,7 @@ class Response:
         if max_age is None:
             max_age = cls.default_send_file_max_age
         if max_age is not None:
-            headers['Cache-Control'] = 'max-age={}'.format(max_age)
+            headers['Cache-Control'] = f'max-age={max_age}'
 
         if compressed:
             headers['Content-Encoding'] = compressed \
@@ -882,7 +862,7 @@ class URLPattern():
                        value of the segment. If omitted, the value is returned
                        as a string.
         """
-        cls.segment_patterns[type_name] = '/({})'.format(pattern)
+        cls.segment_patterns[type_name] = f'/({pattern})'
         cls.segment_parsers[type_name] = parser
 
     def __init__(self, url_pattern):
@@ -909,7 +889,7 @@ class URLPattern():
                     name = segment
                 parser = None
                 if type_.startswith('re:'):
-                    pattern += '/({pattern})'.format(pattern=type_[3:])
+                    pattern += f'/({type_[3:]})'
                 else:
                     if type_ not in self.segment_patterns:
                         raise ValueError('invalid URL segment type')
@@ -947,7 +927,7 @@ class URLPattern():
         return args
 
     def __repr__(self):  # pragma: no cover
-        return 'URLPattern: {}'.format(self.url_pattern)
+        return f'URLPattern: {self.url_pattern}'
 
 
 class HTTPException(Exception):
@@ -956,7 +936,7 @@ class HTTPException(Exception):
         self.reason = reason or str(status_code) + ' error'
 
     def __repr__(self):  # pragma: no cover
-        return 'HTTPException: {}'.format(self.status_code)
+        return f'HTTPException: {self.status_code}'
 
 
 class Microdot:
@@ -983,13 +963,6 @@ class Microdot:
         self.ssl = False
         self.debug = False
         self.server = None
-        # Local defaults for a small embedded HTTP server (seconds).
-        self.request_timeout = 5
-        self.handler_timeout = 5
-        self.response_timeout = 15
-        self.close_timeout = 1
-        self.max_connections = 6
-        self.active_connections = 0
 
     def route(self, url_pattern, methods=None):
         """Decorator that is used to register a function as a request handler
@@ -1117,6 +1090,24 @@ class Microdot:
                 # ...
         """
         return self.route(url_pattern, methods=['DELETE'])
+
+    def query(self, url_pattern):
+        """Decorator that is used to register a function as a ``QUERY``
+        request handler for a given URL.
+
+        :param url_pattern: The URL pattern that will be compared against
+                            incoming requests.
+
+        This decorator can be used as an alias to the ``route`` decorator with
+        ``methods=['QUERY']``.
+
+        Example::
+
+            @app.query('/users/<int:id>')
+            def query_user(request, id):
+                # ...
+        """
+        return self.route(url_pattern, methods=['QUERY'])
 
     def before_request(self, f):
         """Decorator to register a function to run before each request is
@@ -1306,16 +1297,7 @@ class Microdot:
                 writer.awrite = MethodType(awrite, writer)
                 writer.aclose = MethodType(aclose, writer)
 
-            if self.active_connections >= self.max_connections:
-                await self.close_connection(writer)
-                return
-            self.active_connections += 1
-            try:
-                await self.handle_request(reader, writer)
-            except Exception as exc:
-                print_exception(exc)
-            finally:
-                self.active_connections -= 1
+            await self.handle_request(reader, writer)
 
         if self.debug:  # pragma: no cover
             print('Starting async server on {host}:{port}...'.format(
@@ -1430,48 +1412,33 @@ class Microdot:
         allow.append('OPTIONS')
         return {'Allow': ', '.join(allow)}
 
-    async def close_connection(self, writer):
-        try:
-            # Initiate closing even if wait_closed/aclose stalls afterwards.
-            writer.close()
-            await asyncio.wait_for(writer.wait_closed(), self.close_timeout)
-        except (OSError, asyncio.TimeoutError):
-            # CPython can keep a transport alive while flushing buffered output.
-            # MicroPython closes its socket in wait_closed() directly.
-            transport = getattr(writer, 'transport', None)
-            if transport is not None:
-                transport.abort()
-
     async def handle_request(self, reader, writer):
         req = None
         try:
-            try:
-                req = await asyncio.wait_for(
-                    Request.create(self, reader, writer,
-                                   writer.get_extra_info('peername')),
-                    self.request_timeout)
-            except (ValueError, EOFError):
-                res = Response('Bad request', 400)
+            req = await Request.create(self, reader, writer,
+                                       writer.get_extra_info('peername'))
+        except OSError as exc:  # pragma: no cover
+            if exc.errno in MUTED_SOCKET_ERRORS:
+                pass
             else:
-                if req is None:  # Closed speculative connection; no request.
-                    return
-                res = await asyncio.wait_for(self.dispatch_request(req),
-                                             self.handler_timeout)
-            if res != Response.already_handled:
-                res.headers['Connection'] = 'close'
-                await asyncio.wait_for(res.write(writer), self.response_timeout)
-            if self.debug and req:
-                print('{method} {path} {status_code}'.format(
-                    method=req.method, path=req.path, status_code=res.status_code))
-        except asyncio.TimeoutError:
-            if self.debug:
-                print('HTTP connection timed out')
-        except OSError as exc:
-            if exc.errno not in MUTED_SOCKET_ERRORS:
                 raise
-        finally:
-            # Always runs, including parse/dispatch/write errors and cancellation.
-            await self.close_connection(writer)
+        except Exception as exc:  # pragma: no cover
+            print_exception(exc)
+
+        res = await self.dispatch_request(req)
+        try:
+            if res != Response.already_handled:  # pragma: no branch
+                await res.write(writer)
+            await writer.aclose()
+        except OSError as exc:  # pragma: no cover
+            if exc.errno in MUTED_SOCKET_ERRORS:
+                pass
+            else:
+                raise
+        if self.debug and req:  # pragma: no cover
+            print('{method} {path} {status_code}'.format(
+                method=req.method, path=req.path,
+                status_code=res.status_code))
 
     def get_request_handlers(self, req, attr, local_first=True):
         handlers = getattr(self, attr + '_handlers')
@@ -1611,6 +1578,14 @@ class Microdot:
                 res = await invoke_handler(
                     handler, req, res) or res
         res.is_head = (req and req.method == 'HEAD')
+        if req and hasattr(req.g, '_vary'):
+            if res.headers.get('Vary'):
+                vary = set(
+                    [h.strip() for h in res.headers['Vary'].split(',')])
+                vary.update(req.g._vary)
+            else:
+                vary = req.g._vary
+            res.headers['Vary'] = ', '.join(list(vary))
         return res
 
 

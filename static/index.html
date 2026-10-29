@@ -3,9 +3,9 @@
 <head>
     <meta charset="utf-8">
     <title>Medidor de Energía Consola 2m</title>
-    <script src="/static/Chart.min.js" defer></script>
+    <script src="/static/Chart.min.js?v=umd-4.5.0" defer></script>
     <script src="/static/polling.js?v=2" defer></script>
-    <script src="/static/dashboard.js?v=3" defer></script>
+    <script src="/static/dashboard.js?v=4" defer></script>
     <link rel="stylesheet" href="/static/calibration.css">
     <script src="/static/calibration.js?v=4" defer></script>
 </head>
@@ -30,10 +30,11 @@
 
     <p id="connection-status" role="status" style="color:#666; font-size:13px;">Conectando con el ESP32…</p>
 
+    <p id="chart-status" role="status" aria-live="polite">Cargando gráfica…</p>
     <canvas id="chart" width="400" height="200"></canvas>
 
     <footer style="margin-top:25px; text-align:center; color:#666; font-size:13px;">
-        © 2026 — Desarrollado por <strong>Edgar Omar Cadena Zepeda</strong><br>
+        © 2026 — Desarrollado por <strong><a href="mailto:cadena@astro.unam.mx">Edgar Omar Cadena Zepeda</a></strong><br>
         Instituto de Astronomía — UNAM, Ensenada
     </footer>
 
